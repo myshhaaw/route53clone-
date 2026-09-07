@@ -1,0 +1,285 @@
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from secrets import token_urlsafe
+from typing import Literal
+
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, Boolean, create_engine, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+
+engine = create_engine("sqlite:///./route53.db", connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autoflush=False)
+
+class Base(DeclarativeBase): pass
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True)
+    name: Mapped[str] = mapped_column(String(100))
+
+class LoginSession(Base):
+    __tablename__ = "sessions"
+    token: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    expires_at: Mapped[datetime] = mapped_column(DateTime())
+
+class HostedZone(Base):
+    __tablename__ = "hosted_zones"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    comment: Mapped[str] = mapped_column(Text, default="")
+    zone_type: Mapped[str] = mapped_column(String(20), default="Public")
+    created_at: Mapped[datetime] = mapped_column(DateTime(), default=lambda: datetime.now(timezone.utc))
+    records: Mapped[list["DNSRecord"]] = relationship(back_populates="zone", cascade="all, delete-orphan")
+
+class DNSRecord(Base):
+    __tablename__ = "dns_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    zone_id: Mapped[int] = mapped_column(ForeignKey("hosted_zones.id"), index=True)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    type: Mapped[str] = mapped_column(String(10), index=True)
+    value: Mapped[str] = mapped_column(Text)
+    ttl: Mapped[int] = mapped_column(Integer, default=300)
+    routing_policy: Mapped[str] = mapped_column(String(30), default="Simple")
+    created_at: Mapped[datetime] = mapped_column(DateTime(), default=lambda: datetime.now(timezone.utc))
+    zone: Mapped[HostedZone] = relationship(back_populates="records")
+
+RECORD_TYPES = {"A", "AAAA", "CNAME", "TXT", "MX", "NS", "PTR", "SRV", "CAA"}
+class LoginInput(BaseModel): email: str; name: str = "Route 53 User"
+class ZoneInput(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    comment: str = ""
+    zone_type: Literal["Public", "Private"] = "Public"
+class RecordInput(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    type: str
+    value: str = Field(min_length=1)
+    ttl: int = Field(default=300, ge=0, le=2147483647)
+    routing_policy: str = "Simple"
+class BulkIds(BaseModel):
+    ids: list[int] = Field(min_length=1)
+class BindImportInput(BaseModel):
+    text: str = Field(min_length=1)
+class HealthCheckInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    endpoint: str = Field(min_length=1, max_length=255)
+    protocol: Literal["HTTP", "HTTPS"] = "HTTPS"
+    port: int = Field(default=443, ge=1, le=65535)
+    enabled: bool = True
+class TrafficPolicyInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    comment: str = ""
+
+
+def db():
+    session = SessionLocal()
+    try: yield session
+    finally: session.close()
+
+def get_user(session_token: str | None = Cookie(default=None), database: Session = Depends(db)):
+    if not session_token: raise HTTPException(401, "Sign in required")
+    login = database.get(LoginSession, session_token)
+    # SQLite stores plain timestamps, so session timestamps deliberately use UTC-naive values.
+    if not login or login.expires_at < datetime.utcnow(): raise HTTPException(401, "Session expired")
+    user = database.get(User, login.user_id)
+    if not user: raise HTTPException(401, "User not found")
+    return user
+
+def zone_or_404(zone_id: int, database: Session):
+    zone = database.get(HostedZone, zone_id)
+    if not zone: raise HTTPException(404, "Hosted zone not found")
+    return zone
+
+def zone_out(z: HostedZone):
+    return {"id": z.id, "name": z.name, "comment": z.comment, "zone_type": z.zone_type, "record_count": len(z.records), "created_at": z.created_at.isoformat()}
+def record_out(r: DNSRecord):
+    return {"id":r.id,"zone_id":r.zone_id,"name":r.name,"type":r.type,"value":r.value,"ttl":r.ttl,"routing_policy":r.routing_policy,"created_at":r.created_at.isoformat()}
+
+def bind_name(name: str, origin: str) -> str:
+    if name == "@": return origin
+    if name.endswith("."): return name
+    return f"{name}.{origin}"
+
+def records_as_bind(zone: HostedZone, records: list[DNSRecord]) -> str:
+    lines = [f"; Exported from Route 53 Clone", f"$ORIGIN {zone.name}", "$TTL 300", ""]
+    for record in records:
+        label = "@" if record.name == zone.name else record.name.rstrip(".")
+        lines.append(f"{label:<28} {record.ttl:<7} IN {record.type:<6} {record.value}")
+    return "\n".join(lines) + "\n"
+
+def parse_bind(text: str, zone: HostedZone) -> list[dict]:
+    """Parse common one-line BIND records without attempting DNS resolution."""
+    origin, default_ttl = zone.name, 300
+    parsed: list[dict] = []
+    for raw in text.splitlines():
+        line = raw.split(";", 1)[0].strip()
+        if not line: continue
+        upper = line.upper()
+        if upper.startswith("$ORIGIN"):
+            parts = line.split()
+            if len(parts) > 1: origin = parts[1].rstrip(".") + "."
+            continue
+        if upper.startswith("$TTL"):
+            parts = line.split()
+            if len(parts) > 1 and parts[1].isdigit(): default_ttl = int(parts[1])
+            continue
+        parts = line.split()
+        type_index = next((i for i, value in enumerate(parts) if value.upper() in RECORD_TYPES or value.upper() == "SOA"), None)
+        if type_index is None or type_index == 0: continue
+        record_type = parts[type_index].upper()
+        # SOA is intentionally skipped because it is not one of the assignment record types.
+        if record_type not in RECORD_TYPES or type_index + 1 >= len(parts): continue
+        name = bind_name(parts[0], origin)
+        ttl = next((int(value) for value in parts[1:type_index] if value.isdigit()), default_ttl)
+        parsed.append({"name": name, "type": record_type, "value": " ".join(parts[type_index + 1:]), "ttl": ttl, "routing_policy": "Simple"})
+    return parsed
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(engine)
+    with SessionLocal() as s:
+        if not s.scalar(select(User).where(User.email == "admin@example.com")):
+            s.add(User(email="admin@example.com", name="Route 53 Administrator")); s.commit()
+    yield
+
+app = FastAPI(title="Route 53 Clone API", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/health")
+def health(): return {"status":"ok"}
+@app.post("/auth/login")
+def login(body: LoginInput, response: Response, database: Session = Depends(db)):
+    user = database.scalar(select(User).where(User.email == body.email))
+    if not user:
+        user = User(email=body.email, name=body.name); database.add(user); database.commit(); database.refresh(user)
+    token = token_urlsafe(32); database.add(LoginSession(token=token, user_id=user.id, expires_at=datetime.utcnow()+timedelta(days=7))); database.commit()
+    response.set_cookie("session_token", token, httponly=True, samesite="lax", max_age=604800)
+    return {"id":user.id,"email":user.email,"name":user.name}
+@app.post("/auth/logout", status_code=204)
+def logout(response: Response, session_token: str | None = Cookie(default=None), database: Session = Depends(db)):
+    if session_token:
+        item=database.get(LoginSession, session_token)
+        if item: database.delete(item); database.commit()
+    response.delete_cookie("session_token")
+@app.get("/auth/me")
+def me(user: User = Depends(get_user)): return {"id":user.id,"email":user.email,"name":user.name}
+
+@app.get("/dashboard/summary")
+def dashboard_summary(_: User = Depends(get_user), database: Session = Depends(db)):
+    zones = database.scalars(select(HostedZone)).all()
+    checks = database.scalars(select(HealthCheck)).all()
+    policies = database.scalars(select(TrafficPolicy)).all()
+    return {"hosted_zones":len(zones),"records":sum(len(z.records) for z in zones),"health_checks":len(checks),"traffic_policies":len(policies),"registered_domains":0,"readiness_checks":0,"control_panels":0}
+
+@app.get("/domains/check")
+def check_domain(domain: str, _: User = Depends(get_user)):
+    normalized = domain.strip().lower().strip(".")
+    if not normalized or "." not in normalized:
+        raise HTTPException(422, "Enter a fully qualified domain name")
+    unavailable = {"amazon.com", "aws.com", "example.com", "google.com"}
+    return {"domain":normalized,"available":normalized not in unavailable,"price":12.0}
+
+@app.get("/health-checks")
+def list_health_checks(_: User = Depends(get_user), database: Session = Depends(db)):
+    rows=database.scalars(select(HealthCheck).order_by(HealthCheck.name)).all()
+    return {"items":[{"id":x.id,"name":x.name,"endpoint":x.endpoint,"protocol":x.protocol,"port":x.port,"enabled":x.enabled} for x in rows],"total":len(rows)}
+@app.post("/health-checks", status_code=201)
+def create_health_check(body: HealthCheckInput, _: User = Depends(get_user), database: Session = Depends(db)):
+    x=HealthCheck(**body.model_dump());database.add(x);database.commit();database.refresh(x);return {"id":x.id,"name":x.name,"endpoint":x.endpoint,"protocol":x.protocol,"port":x.port,"enabled":x.enabled}
+@app.delete("/health-checks/{check_id}", status_code=204)
+def delete_health_check(check_id:int, _:User=Depends(get_user), database:Session=Depends(db)):
+    x=database.get(HealthCheck,check_id)
+    if not x: raise HTTPException(404,"Health check not found")
+    database.delete(x);database.commit()
+
+@app.get("/traffic-policies")
+def list_policies(_: User = Depends(get_user), database: Session = Depends(db)):
+    rows=database.scalars(select(TrafficPolicy).order_by(TrafficPolicy.name)).all()
+    return {"items":[{"id":x.id,"name":x.name,"comment":x.comment,"version":x.version} for x in rows],"total":len(rows)}
+@app.post("/traffic-policies", status_code=201)
+def create_policy(body:TrafficPolicyInput, _:User=Depends(get_user), database:Session=Depends(db)):
+    if database.scalar(select(TrafficPolicy).where(TrafficPolicy.name==body.name)): raise HTTPException(409,"A policy with that name already exists")
+    x=TrafficPolicy(**body.model_dump());database.add(x);database.commit();database.refresh(x);return {"id":x.id,"name":x.name,"comment":x.comment,"version":x.version}
+@app.delete("/traffic-policies/{policy_id}", status_code=204)
+def delete_policy(policy_id:int, _:User=Depends(get_user), database:Session=Depends(db)):
+    x=database.get(TrafficPolicy,policy_id)
+    if not x: raise HTTPException(404,"Traffic policy not found")
+    database.delete(x);database.commit()
+
+@app.get("/hosted-zones")
+def list_zones(search: str = "", page: int = 1, page_size: int = 10, _: User = Depends(get_user), database: Session = Depends(db)):
+    statement = select(HostedZone).where(HostedZone.name.contains(search)).order_by(HostedZone.name)
+    total=len(database.scalars(statement).all()); items=database.scalars(statement.offset((page-1)*page_size).limit(page_size)).all()
+    return {"items":[zone_out(x) for x in items],"total":total,"page":page,"page_size":page_size}
+@app.post("/hosted-zones", status_code=201)
+def create_zone(body: ZoneInput, _: User = Depends(get_user), database: Session = Depends(db)):
+    name=body.name.rstrip(".")+"."
+    if database.scalar(select(HostedZone).where(HostedZone.name == name)): raise HTTPException(409,"A hosted zone with that domain already exists")
+    z=HostedZone(name=name,comment=body.comment,zone_type=body.zone_type); database.add(z); database.commit(); database.refresh(z); return zone_out(z)
+@app.post("/hosted-zones/bulk-delete", status_code=204)
+def bulk_delete_zones(body: BulkIds, _: User = Depends(get_user), database: Session = Depends(db)):
+    zones = database.scalars(select(HostedZone).where(HostedZone.id.in_(body.ids))).all()
+    for zone in zones: database.delete(zone)
+    database.commit()
+@app.get("/hosted-zones/export")
+def export_zones(format: Literal["json", "bind"] = "json", _: User = Depends(get_user), database: Session = Depends(db)):
+    zones = database.scalars(select(HostedZone).order_by(HostedZone.name)).all()
+    if format == "json":
+        return {"hosted_zones": [{**zone_out(zone), "records": [record_out(record) for record in zone.records]} for zone in zones]}
+    content = "\n".join(records_as_bind(zone, zone.records) for zone in zones)
+    return Response(content, media_type="text/plain", headers={"Content-Disposition": "attachment; filename=hosted-zones.bind"})
+@app.get("/hosted-zones/{zone_id}")
+def get_zone(zone_id:int, _:User=Depends(get_user), database:Session=Depends(db)): return zone_out(zone_or_404(zone_id,database))
+@app.put("/hosted-zones/{zone_id}")
+def update_zone(zone_id:int, body:ZoneInput, _:User=Depends(get_user), database:Session=Depends(db)):
+    z=zone_or_404(zone_id,database); z.name=body.name.rstrip(".")+"."; z.comment=body.comment; z.zone_type=body.zone_type; database.commit(); database.refresh(z); return zone_out(z)
+@app.delete("/hosted-zones/{zone_id}", status_code=204)
+def delete_zone(zone_id:int, _:User=Depends(get_user), database:Session=Depends(db)):
+    database.delete(zone_or_404(zone_id,database)); database.commit()
+
+@app.get("/hosted-zones/{zone_id}/records")
+def list_records(zone_id:int, search:str="", type:str="", page:int=1, page_size:int=10, _:User=Depends(get_user), database:Session=Depends(db)):
+    zone_or_404(zone_id,database); q=select(DNSRecord).where(DNSRecord.zone_id==zone_id)
+    if search: q=q.where((DNSRecord.name.contains(search)) | (DNSRecord.value.contains(search)))
+    if type: q=q.where(DNSRecord.type==type)
+    q=q.order_by(DNSRecord.name,DNSRecord.type); total=len(database.scalars(q).all()); items=database.scalars(q.offset((page-1)*page_size).limit(page_size)).all()
+    return {"items":[record_out(x) for x in items],"total":total,"page":page,"page_size":page_size}
+@app.post("/hosted-zones/{zone_id}/records",status_code=201)
+def create_record(zone_id:int, body:RecordInput, _:User=Depends(get_user), database:Session=Depends(db)):
+    zone_or_404(zone_id,database)
+    if body.type not in RECORD_TYPES: raise HTTPException(422,"Unsupported record type")
+    r=DNSRecord(zone_id=zone_id,**body.model_dump());database.add(r);database.commit();database.refresh(r);return record_out(r)
+@app.put("/hosted-zones/{zone_id}/records/{record_id}")
+def update_record(zone_id:int,record_id:int,body:RecordInput,_:User=Depends(get_user),database:Session=Depends(db)):
+    zone_or_404(zone_id,database); r=database.get(DNSRecord,record_id)
+    if not r or r.zone_id!=zone_id: raise HTTPException(404,"Record not found")
+    if body.type not in RECORD_TYPES: raise HTTPException(422,"Unsupported record type")
+    for k,v in body.model_dump().items(): setattr(r,k,v)
+    database.commit();database.refresh(r);return record_out(r)
+@app.delete("/hosted-zones/{zone_id}/records/{record_id}",status_code=204)
+def delete_record(zone_id:int,record_id:int,_:User=Depends(get_user),database:Session=Depends(db)):
+    zone_or_404(zone_id,database);r=database.get(DNSRecord,record_id)
+    if not r or r.zone_id!=zone_id: raise HTTPException(404,"Record not found")
+    database.delete(r);database.commit()
+@app.post("/hosted-zones/{zone_id}/records/bulk-delete", status_code=204)
+def bulk_delete_records(zone_id: int, body: BulkIds, _: User = Depends(get_user), database: Session = Depends(db)):
+    zone_or_404(zone_id, database)
+    records = database.scalars(select(DNSRecord).where(DNSRecord.zone_id == zone_id, DNSRecord.id.in_(body.ids))).all()
+    for record in records: database.delete(record)
+    database.commit()
+@app.post("/hosted-zones/{zone_id}/records/import-bind")
+def import_bind(zone_id: int, body: BindImportInput, _: User = Depends(get_user), database: Session = Depends(db)):
+    zone = zone_or_404(zone_id, database)
+    records = [DNSRecord(zone_id=zone.id, **record) for record in parse_bind(body.text, zone)]
+    if not records: raise HTTPException(422, "No supported DNS records were found in the BIND zone file")
+    database.add_all(records); database.commit()
+    return {"imported": len(records), "records": [record_out(record) for record in records]}
+@app.get("/hosted-zones/{zone_id}/export")
+def export_zone(zone_id: int, format: Literal["json", "bind"] = "json", _: User = Depends(get_user), database: Session = Depends(db)):
+    zone = zone_or_404(zone_id, database)
+    if format == "json": return {**zone_out(zone), "records": [record_out(record) for record in zone.records]}
+    filename = zone.name.rstrip(".") + ".zone"
+    return Response(records_as_bind(zone, zone.records), media_type="text/plain", headers={"Content-Disposition": f"attachment; filename={filename}"})

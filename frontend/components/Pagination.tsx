@@ -1,0 +1,2 @@
+"use client";
+export function Pagination({page,total,size,setPage}:{page:number;total:number;size:number;setPage:(p:number)=>void}){const pages=Math.max(1,Math.ceil(total/size));return <div className="pagination"><span>Showing {total?((page-1)*size+1):0}-{Math.min(page*size,total)} of {total}</span><button className="secondary" disabled={page===1} onClick={()=>setPage(page-1)}>‹ Previous</button><span>Page {page} of {pages}</span><button className="secondary" disabled={page===pages} onClick={()=>setPage(page+1)}>Next ›</button></div>}
